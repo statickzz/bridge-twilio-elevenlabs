@@ -49,85 +49,37 @@ wss.on('connection', (twilioWs, request) => {
       console.log('📨 Config audio envoyée à ElevenLabs');
     });
 
-    elevenWs.on('message', (message) => {
-    // D'ABORD, on vérifie si c'est du JSON ou de l'audio binaire
-    try {
-      // C'est un message JSON (contrôle ou audio)
-      const data = JSON.parse(message);
-
-      if (data.type) {
-          console.log(`📨 ElevenLabs message: ${data.type}`);
-      }
-      
-      // --- CORRECTION PRINCIPALE ---
-      // Si c'est un message 'audio', le payload est DÉJÀ en Base64 µ-law (8kHz)
-      // car on a spécifié "provider": "twilio" lors de la connexion.
-      if (data.type === 'audio' && data.audio) {
-        
-        console.log(`🔈 Audio JSON (µ-law) reçu (taille: ${data.audio.length})`);
-
-        // On l'envoie DIRECTEMENT à Twilio, SANS conversion
-        if (twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({
-            event: 'media',
-            streamSid: streamSid,
-            media: {
-              payload: data.audio // On passe le payload tel quel
-            }
-          }));
-          console.log('🔊 Audio (µ-law) envoyé à Twilio !');
-        } else {
-          console.warn('⚠️ Audio reçu, mais socket Twilio fermé.');
-        }
-
-      }
-      // --- FIN DE LA CORRECTION ---
-
-    } catch (err) {
-      // Si JSON.parse échoue, c'est que c'est de L'AUDIO BINAIRE (Buffer)
-      // Note : Avec l'API ConvAI et "provider": "twilio", ce bloc 
-      // ne devrait presque jamais être atteint pour l'audio.
-      if (Buffer.isBuffer(message)) {
-        console.warn(`🔈 Audio Binaire reçu (taille: ${message.length}). Traitement ancien...`);
-        // On garde votre ancienne logique au cas où,
-        // mais elle suppose que le binaire est du PCM 16k
-        sendAudioToTwilio(message, 16000); // 16kHz
-      } else {
-        console.error('❌ Erreur: Message inconnu d\'ElevenLabs', message);
-      }
-    }
-  });
-
-    // J'ai créé une fonction séparée pour envoyer l'audio
-    function sendAudioToTwilio(pcmBuffer, inputSampleRate) {
+    elevenWs.on('message', (message) => { // <-- MODIFIÉ : 'message' est plus sûr que 'data'
       try {
-        // Conversion PCM (16k ou 8k) -> µ-law 8k
-        let pcmToConvert = pcmBuffer;
-        if (inputSampleRate === 16000) {
-          pcmToConvert = downsample(pcmBuffer, 16000, 8000);
+        // <-- MODIFIÉ : ElevenLabs envoie du JSON, pas des buffers bruts
+        const data = JSON.parse(message);
+        
+        if (data.type === 'audio' && data.audio) {
+          // Audio depuis ElevenLabs (PCM 16kHz) → Twilio (µ-law 8kHz)
+          const pcm16Buffer = Buffer.from(data.audio, 'base64');
+          
+          // Conversion
+          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); // <-- MODIFIÉ
+          const ulawBuffer = pcmToUlaw(pcm16Downsampled); // <-- MODIFIÉ
+          const audioPayload = ulawBuffer.toString('base64');
+          
+          if (twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: streamSid,
+              media: {
+                payload: audioPayload
+              }
+            }));
+          }
+        } else if (data.type) {
+            console.log(`📨 ElevenLabs message: ${data.type}`);
         }
-        
-        const ulawBuffer = pcmToUlaw(pcmToConvert);
-        const audioPayload = ulawBuffer.toString('base64');
-        
-        console.log(`🔈 Audio converti pour Twilio (taille: ${audioPayload.length})`);
 
-        if (twilioWs.readyState === WebSocket.OPEN) {
-          twilioWs.send(JSON.stringify({
-            event: 'media',
-            streamSid: streamSid,
-            media: {
-              payload: audioPayload
-            }
-          }));
-          console.log('🔊 Audio envoyé à Twilio !');
-        } else {
-          console.warn('⚠️ Audio reçu, mais socket Twilio fermé.');
-        }
-      } catch (convertErr) {
-        console.error('❌ Erreur conversion audio:', convertErr.message);
+      } catch (err) {
+        console.error('❌ Erreur ElevenLabs → Twilio:', err);
       }
-    }
+    });
 
     elevenWs.on('error', (err) => {
       console.error('❌ Erreur ElevenLabs:', err.message);
