@@ -16,41 +16,13 @@ app.get('/health', (req, res) => {
   res.send('OK');
 });
 
-// Conversion µ-law vers PCM16
-function mulawToPcm16(mulawByte) {
-  const MULAW_BIAS = 33;
-  mulawByte = ~mulawByte;
-  const sign = mulawByte & 0x80;
-  const exponent = (mulawByte >> 4) & 0x07;
-  const mantissa = mulawByte & 0x0F;
-  let sample = mantissa << (exponent + 3);
-  sample += MULAW_BIAS << exponent;
-  if (sign !== 0) sample = -sample;
-  return sample;
-}
-
-// Conversion PCM16 vers µ-law
-function pcm16ToMulaw(pcm16) {
-  const MULAW_MAX = 0x1FFF;
-  const MULAW_BIAS = 33;
-  let sign = (pcm16 >> 8) & 0x80;
-  if (sign !== 0) pcm16 = -pcm16;
-  if (pcm16 > MULAW_MAX) pcm16 = MULAW_MAX;
-  pcm16 += MULAW_BIAS;
-  let exponent = 7;
-  for (let exp_mask = 0x4000; (pcm16 & exp_mask) === 0 && exponent > 0; exponent--, exp_mask >>= 1);
-  const mantissa = (pcm16 >> (exponent + 3)) & 0x0F;
-  const mulawByte = ~(sign | (exponent << 4) | mantissa);
-  return mulawByte & 0xFF;
-}
-
 // Gestion des connexions WebSocket
 wss.on('connection', (twilioWs, request) => {
   console.log('📞 Twilio connecté');
   
   let elevenWs = null;
   let streamSid = null;
-  let callSid = null;
+  // let callSid = null; // Pas nécessaire ici
 
   // Connexion à ElevenLabs
   function connectToElevenLabs() {
@@ -65,72 +37,47 @@ wss.on('connection', (twilioWs, request) => {
     elevenWs.on('open', () => {
       console.log('🤖 ElevenLabs connecté');
       
-      // Configuration initiale ElevenLabs
-      const config = {
-        type: 'conversation_initiation_client_data',
-        conversation_config_override: {
-          agent: {
-            prompt: {
-              prompt: "Tu es un assistant vocal sympathique."
-            },
-            first_message: "Bonjour ! Comment puis-je vous aider ?"
-          },
-          tts: {
-            model_id: "eleven_flash_v2_5"
-          }
+      // <-- MODIFIÉ : Il faut envoyer la configuration audio !
+      const initialConfig = {
+        "provider": "twilio",
+        "format": {
+          "type": "pcm",
+          "sample_rate": 16000 // On va lui envoyer du 16kHz
         }
       };
-      
-      elevenWs.send(JSON.stringify(config));
+      elevenWs.send(JSON.stringify(initialConfig));
+      console.log('📨 Config audio envoyée à ElevenLabs');
     });
 
-    elevenWs.on('message', (data) => {
+    elevenWs.on('message', (message) => { // <-- MODIFIÉ : 'message' est plus sûr que 'data'
       try {
-        // Essayer de parser comme JSON d'abord
-        try {
-          const msg = JSON.parse(data.toString());
-          console.log('📨 ElevenLabs message:', msg.type || 'unknown');
+        // <-- MODIFIÉ : ElevenLabs envoie du JSON, pas des buffers bruts
+        const data = JSON.parse(message);
+        
+        if (data.type === 'audio' && data.audio) {
+          // Audio depuis ElevenLabs (PCM 16kHz) → Twilio (µ-law 8kHz)
+          const pcm16Buffer = Buffer.from(data.audio, 'base64');
           
-          // Si c'est de l'audio dans le JSON
-          if (msg.type === 'audio' && msg.audio) {
-            const pcm16Audio = Buffer.from(msg.audio, 'base64');
-            
-            // Conversion PCM16 16kHz → µ-law 8kHz
-            const mulawAudio = Buffer.alloc(Math.floor(pcm16Audio.length / 4));
-            for (let i = 0, j = 0; i < pcm16Audio.length; i += 4, j++) {
-              const sample = pcm16Audio.readInt16LE(i);
-              mulawAudio[j] = pcm16ToMulaw(sample);
-            }
-            
+          // Conversion
+          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); // <-- MODIFIÉ
+          const ulawBuffer = pcmToUlaw(pcm16Downsampled); // <-- MODIFIÉ
+          const audioPayload = ulawBuffer.toString('base64');
+          
+          if (twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({
               event: 'media',
               streamSid: streamSid,
               media: {
-                payload: mulawAudio.toString('base64')
+                payload: audioPayload
               }
             }));
           }
-        } catch (parseErr) {
-          // Si ce n'est pas du JSON, c'est de l'audio brut
-          if (Buffer.isBuffer(data)) {
-            // Conversion PCM16 16kHz → µ-law 8kHz
-            const mulawAudio = Buffer.alloc(Math.floor(data.length / 4));
-            for (let i = 0, j = 0; i < data.length; i += 4, j++) {
-              const sample = data.readInt16LE(i);
-              mulawAudio[j] = pcm16ToMulaw(sample);
-            }
-            
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: {
-                payload: mulawAudio.toString('base64')
-              }
-            }));
-          }
+        } else if (data.type) {
+            console.log(`📨 ElevenLabs message: ${data.type}`);
         }
+
       } catch (err) {
-        console.error('❌ Erreur ElevenLabs → Twilio:', err.message);
+        console.error('❌ Erreur ElevenLabs → Twilio:', err);
       }
     });
 
@@ -138,10 +85,10 @@ wss.on('connection', (twilioWs, request) => {
       console.error('❌ Erreur ElevenLabs:', err.message);
     });
 
-    elevenWs.on('close', (code, reason) => {
-      console.log(`🔴 ElevenLabs déconnecté (code: ${code}, reason: ${reason})`);
+    elevenWs.on('close', (code, reason) => { // <-- MODIFIÉ : Ajout des logs
+      console.log(`🔴 ElevenLabs déconnecté (code: ${code}, reason: ${reason.toString()})`);
       if (twilioWs.readyState === WebSocket.OPEN) {
-        twilioWs.close();
+        twilioWs.send(JSON.stringify({ event: 'stop', streamSid: streamSid }));
       }
     });
   }
@@ -152,9 +99,10 @@ wss.on('connection', (twilioWs, request) => {
       const msg = JSON.parse(message);
 
       switch (msg.event) {
-        case 'start':
-          streamSid = msg.start.streamSid;
-          callSid = msg.start.callSid;
+        // <-- MODIFIÉ : L'événement de Twilio s'appelle 'connected', pas 'start'
+        case 'connected': 
+          streamSid = msg.streamSid;
+          // callSid = msg.callSid; // callSid est dans msg.start, mais pas besoin
           console.log(`🟢 Stream démarré: ${streamSid}`);
           
           // Connexion à ElevenLabs maintenant
@@ -162,43 +110,38 @@ wss.on('connection', (twilioWs, request) => {
           break;
 
         case 'media':
-          // Audio depuis Twilio → ElevenLabs
+          // Audio depuis Twilio (µ-law 8kHz) → ElevenLabs (PCM 16kHz)
           if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
-            const mulawBuffer = Buffer.from(msg.media.payload, 'base64');
+            const ulawBuffer = Buffer.from(msg.media.payload, 'base64');
             
-            // Conversion µ-law 8kHz → PCM16 16kHz
-            const pcm16Buffer = Buffer.alloc(mulawBuffer.length * 4);
-            for (let i = 0; i < mulawBuffer.length; i++) {
-              const pcm16Sample = mulawToPcm16(mulawBuffer[i]);
-              // Upsample: répéter chaque sample 2 fois pour passer de 8kHz à 16kHz
-              pcm16Buffer.writeInt16LE(pcm16Sample, i * 4);
-              pcm16Buffer.writeInt16LE(pcm16Sample, i * 4 + 2);
-            }
+            // <-- MODIFIÉ : Conversion audio
+            const pcm16Buffer = ulawToPcm(ulawBuffer);
+            const pcm16Upsampled = upsample(pcm16Buffer, 8000, 16000);
             
-            // Envoyer l'audio à ElevenLabs
-            const audioMessage = {
-              user_audio_chunk: pcm16Buffer.toString('base64')
-            };
-            elevenWs.send(JSON.stringify(audioMessage));
+            // <-- MODIFIÉ : Envoyer en JSON
+            elevenWs.send(JSON.stringify({
+              "type": "audio_input",
+              "audio": pcm16Upsampled.toString('base64')
+            }));
           }
           break;
 
         case 'stop':
-          console.log('🛑 Stream arrêté');
-          if (elevenWs) {
-            elevenWs.close();
+          console.log('🛑 Stream arrêté par Twilio');
+          if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
+            elevenWs.close(1000, 'Twilio stream stopped');
           }
           break;
       }
     } catch (err) {
-      console.error('❌ Erreur traitement message Twilio:', err.message);
+      console.error('❌ Erreur traitement message Twilio:', err);
     }
   });
 
   twilioWs.on('close', () => {
     console.log('🔴 Twilio déconnecté');
-    if (elevenWs) {
-      elevenWs.close();
+    if (elevenWs && elevenWs.readyState !== WebSocket.CLOSED) {
+      elevenWs.close(1000, 'Twilio connection closed');
     }
   });
 
@@ -217,3 +160,89 @@ server.on('upgrade', (request, socket, head) => {
     wss.emit('connection', ws, request);
   });
 });
+
+
+// --- Fonctions de conversion audio ---
+// <-- MODIFIÉ : Tout ce bloc est nécessaire
+
+// Convertir µ-law (Buffer) en PCM 16-bit (Buffer)
+function ulawToPcm(ulawBuffer) {
+  const pcmBuffer = Buffer.alloc(ulawBuffer.length * 2);
+  for (let i = 0; i < ulawBuffer.length; i++) {
+    const ulawByte = ulawBuffer[i];
+    let biased = (ulawByte ^ 0xFF) | 0x80;
+    if (biased < 0) biased = biased + 256;
+    if (biased > 255) biased = biased - 256;
+    
+    let sign = (biased & 0x80) === 0 ? -1 : 1;
+    let exponent = (biased >> 4) & 0x07;
+    let mantissa = biased & 0x0F;
+    let sample = (mantissa << 4) + 8;
+    sample = (sample << (exponent + 3));
+    sample = (exponent === 0) ? (sample - 132) : (sample + 132);
+    sample = (sample * sign);
+    pcmBuffer.writeInt16LE(sample, i * 2);
+  }
+  return pcmBuffer;
+}
+
+// Convertir PCM 16-bit (Buffer) en µ-law (Buffer)
+function pcmToUlaw(pcmBuffer) {
+  const ulawBuffer = Buffer.alloc(pcmBuffer.length / 2);
+  const bias = 0x84;
+  const maxSample = 32635;
+
+  for (let i = 0; i < ulawBuffer.length; i++) {
+    let sample = pcmBuffer.readInt16LE(i * 2);
+    let sign = (sample < 0) ? 0x00 : 0x80;
+    
+    sample = Math.abs(sample);
+    if (sample > maxSample) sample = maxSample;
+    sample += bias;
+
+    let exponent = 7;
+    for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+    let mantissa = (sample >> (exponent + 3)) & 0x0F;
+    let ulawByte = (sign | (exponent << 4) | mantissa);
+    ulawBuffer[i] = ulawByte ^ 0xFF;
+  }
+  return ulawBuffer;
+}
+
+// Ré-échantillonnage simple (interpolation linéaire)
+function upsample(buffer, inputRate, outputRate) {
+  if (inputRate === outputRate) return buffer;
+  
+  const ratio = inputRate / outputRate;
+  const outputLength = Math.floor(buffer.length / 2 * (outputRate / inputRate));
+  const outputBuffer = Buffer.alloc(outputLength * 2);
+
+  for (let i = 0; i < outputLength; i++) {
+    const inIndexFloat = i * ratio;
+    const inIndexInt = Math.floor(inIndexFloat);
+    const frac = inIndexFloat - inIndexInt;
+    const inIndex1 = Math.min(inIndexInt, (buffer.length / 2) - 2);
+    const inIndex2 = inIndex1 + 1;
+    const sample1 = buffer.readInt16LE(inIndex1 * 2);
+    const sample2 = buffer.readInt16LE(inIndex2 * 2);
+    const outputSample = sample1 + (sample2 - sample1) * frac;
+    outputBuffer.writeInt16LE(Math.round(outputSample), i * 2);
+  }
+  return outputBuffer;
+}
+
+// Downsampling (plus simple, on prend 1 échantillon sur N)
+function downsample(buffer, inputRate, outputRate) {
+    if (inputRate === outputRate) return buffer;
+
+    const ratio = inputRate / outputRate;
+    const outputLength = Math.floor(buffer.length / 2 / ratio);
+    const outputBuffer = Buffer.alloc(outputLength * 2);
+
+    for (let i = 0; i < outputLength; i++) {
+        const inIndex = Math.floor(i * ratio);
+        const sample = buffer.readInt16LE(inIndex * 2);
+        outputBuffer.writeInt16LE(sample, i * 2);
+    }
+    return outputBuffer;
+}
