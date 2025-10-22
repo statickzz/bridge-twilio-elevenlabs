@@ -39,12 +39,16 @@ wss.on('connection', (twilioWs, request) => {
       
       // <-- MODIFIÉ : Il faut envoyer la configuration audio !
       const initialConfig = {
-        "provider": "twilio",
-        "format": {
-          "type": "pcm",
-          "sample_rate": 16000 // On va lui envoyer du 16kHz
-        }
-      };
+  "provider": "twilio",
+  "input_format": { // Ce que NOUS envoyons à ElevenLabs
+    "type": "pcm",
+    "sample_rate": 16000 
+  },
+  "output_format": { // Ce que nous VOULONS RECEVOIR d'ElevenLabs
+    "type": "mulaw",
+    "sample_rate": 8000
+  }
+};
       elevenWs.send(JSON.stringify(initialConfig));
       console.log('📨 Config audio envoyée à ElevenLabs');
     });
