@@ -50,47 +50,65 @@ wss.on('connection', (twilioWs, request) => {
     });
 
     elevenWs.on('message', (message) => {
+      // D'ABORD, on vérifie si c'est du JSON ou de l'audio binaire
       try {
+        // C'est un message JSON (contrôle)
         const data = JSON.parse(message);
-        
-        if (data.type === 'audio' && data.audio) {
-          // <-- LOG 1
-          console.log(`🔈 Audio reçu d'ElevenLabs (taille base64: ${data.audio.length})`);
-          
-          // Audio depuis ElevenLabs (PCM 16kHz) → Twilio (µ-law 8kHz)
-          const pcm16Buffer = Buffer.from(data.audio, 'base64');
-          
-          // Conversion
-          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); 
-          const ulawBuffer = pcmToUlaw(pcm16Downsampled); 
-          const audioPayload = ulawBuffer.toString('base64');
 
-          // <-- LOG 2
-          console.log(`🔈 Audio converti pour Twilio (taille base64: ${audioPayload.length})`);
-          
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid, // streamSid est correct maintenant
-              media: {
-                payload: audioPayload
-              }
-            }));
-            // <-- LOG 3
-            console.log('🔊 Audio envoyé à Twilio !');
-          } else {
-            // <-- LOG 4
-            console.warn('⚠️ Audio reçu, mais socket Twilio fermé.');
-          }
-        } else if (data.type) {
+        if (data.type) {
             console.log(`📨 ElevenLabs message: ${data.type}`);
+        }
+        
+        // Si c'est un message 'audio' AVEC payload (certaines API le font)
+        if (data.type === 'audio' && data.audio) {
+          console.log(`🔈 Audio JSON reçu (taille: ${data.audio.length})`);
+          // (On gère au cas où, mais c'est peu probable)
+          const pcm16Buffer = Buffer.from(data.audio, 'base64');
+          sendAudioToTwilio(pcm16Buffer, 16000); // 16kHz
         }
 
       } catch (err) {
-        // <-- LOG 5 (amélioré)
-        console.error('❌ Erreur ElevenLabs → Twilio:', err.message, err.stack);
+        // Si JSON.parse échoue, c'est que c'est de L'AUDIO BINAIRE (Buffer)
+        if (Buffer.isBuffer(message)) {
+          console.log(`🔈 Audio Binaire reçu (taille: ${message.length})`);
+          // Le buffer est déjà du PCM 16kHz (d'après leur doc)
+          sendAudioToTwilio(message, 16000); // 16kHz
+        } else {
+          console.error('❌ Erreur: Message inconnu d\'ElevenLabs', message);
+        }
       }
     });
+
+    // J'ai créé une fonction séparée pour envoyer l'audio
+    function sendAudioToTwilio(pcmBuffer, inputSampleRate) {
+      try {
+        // Conversion PCM (16k ou 8k) -> µ-law 8k
+        let pcmToConvert = pcmBuffer;
+        if (inputSampleRate === 16000) {
+          pcmToConvert = downsample(pcmBuffer, 16000, 8000);
+        }
+        
+        const ulawBuffer = pcmToUlaw(pcmToConvert);
+        const audioPayload = ulawBuffer.toString('base64');
+        
+        console.log(`🔈 Audio converti pour Twilio (taille: ${audioPayload.length})`);
+
+        if (twilioWs.readyState === WebSocket.OPEN) {
+          twilioWs.send(JSON.stringify({
+            event: 'media',
+            streamSid: streamSid,
+            media: {
+              payload: audioPayload
+            }
+          }));
+          console.log('🔊 Audio envoyé à Twilio !');
+        } else {
+          console.warn('⚠️ Audio reçu, mais socket Twilio fermé.');
+        }
+      } catch (convertErr) {
+        console.error('❌ Erreur conversion audio:', convertErr.message);
+      }
+    }
 
     elevenWs.on('error', (err) => {
       console.error('❌ Erreur ElevenLabs:', err.message);
