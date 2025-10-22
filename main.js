@@ -49,35 +49,46 @@ wss.on('connection', (twilioWs, request) => {
       console.log('📨 Config audio envoyée à ElevenLabs');
     });
 
-    elevenWs.on('message', (message) => { // <-- MODIFIÉ : 'message' est plus sûr que 'data'
+    elevenWs.on('message', (message) => {
       try {
-        // <-- MODIFIÉ : ElevenLabs envoie du JSON, pas des buffers bruts
         const data = JSON.parse(message);
         
         if (data.type === 'audio' && data.audio) {
+          // <-- LOG 1
+          console.log(`🔈 Audio reçu d'ElevenLabs (taille base64: ${data.audio.length})`);
+          
           // Audio depuis ElevenLabs (PCM 16kHz) → Twilio (µ-law 8kHz)
           const pcm16Buffer = Buffer.from(data.audio, 'base64');
           
           // Conversion
-          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); // <-- MODIFIÉ
-          const ulawBuffer = pcmToUlaw(pcm16Downsampled); // <-- MODIFIÉ
+          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); 
+          const ulawBuffer = pcmToUlaw(pcm16Downsampled); 
           const audioPayload = ulawBuffer.toString('base64');
+
+          // <-- LOG 2
+          console.log(`🔈 Audio converti pour Twilio (taille base64: ${audioPayload.length})`);
           
           if (twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({
               event: 'media',
-              streamSid: streamSid,
+              streamSid: streamSid, // streamSid est correct maintenant
               media: {
                 payload: audioPayload
               }
             }));
+            // <-- LOG 3
+            console.log('🔊 Audio envoyé à Twilio !');
+          } else {
+            // <-- LOG 4
+            console.warn('⚠️ Audio reçu, mais socket Twilio fermé.');
           }
         } else if (data.type) {
             console.log(`📨 ElevenLabs message: ${data.type}`);
         }
 
       } catch (err) {
-        console.error('❌ Erreur ElevenLabs → Twilio:', err);
+        // <-- LOG 5 (amélioré)
+        console.error('❌ Erreur ElevenLabs → Twilio:', err.message, err.stack);
       }
     });
 
