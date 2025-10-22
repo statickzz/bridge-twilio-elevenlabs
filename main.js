@@ -22,7 +22,6 @@ wss.on('connection', (twilioWs, request) => {
   
   let elevenWs = null;
   let streamSid = null;
-  // let callSid = null; // Pas nécessaire ici
 
   // Connexion à ElevenLabs
   function connectToElevenLabs() {
@@ -37,41 +36,57 @@ wss.on('connection', (twilioWs, request) => {
     elevenWs.on('open', () => {
       console.log('🤖 ElevenLabs connecté');
       
-      // <-- MODIFIÉ : Il faut envoyer la configuration audio !
+      // On demande explicitement du PCM à ElevenLabs pour tester notre conversion manuelle.
       const initialConfig = {
-  "provider": "twilio",
-  "input_format": { // Ce que NOUS envoyons à ElevenLabs
-    "type": "pcm",
-    "sample_rate": 16000 
-  },
-  "output_format": { // Ce que nous VOULONS RECEVOIR d'ElevenLabs
-    "type": "mulaw",
-    "sample_rate": 8000
-  }
-};
+        "provider": "twilio",
+        "format": {
+          "type": "pcm",
+          "sample_rate": 16000 
+        }
+      };
       elevenWs.send(JSON.stringify(initialConfig));
-      console.log('📨 Config audio envoyée à ElevenLabs');
+      console.log('📨 Config audio (demande de PCM 16kHz) envoyée à ElevenLabs');
     });
 
-    elevenWs.on('message', (message) => { // <-- MODIFIÉ : 'message' est plus sûr que 'data'
+    elevenWs.on('message', (message) => {
       try {
-        // <-- MODIFIÉ : ElevenLabs envoie du JSON, pas des buffers bruts
         const data = JSON.parse(message);
         
         if (data.type === 'audio' && data.audio) {
-  // L'audio reçu est déjà au bon format (µ-law 8kHz, base64)
-  // On le relaie directement à Twilio.
-  if (twilioWs.readyState === WebSocket.OPEN) {
-    twilioWs.send(JSON.stringify({
-      event: 'media',
-      streamSid: streamSid,
-      media: {
-        // Le payload d'ElevenLabs est déjà ce que Twilio attend !
-        payload: data.audio 
-      }
-    }));
-  }
-} else if (data.type) {
+          // --- DÉBUT DU BLOC DE DÉBOGAGE ---
+
+          // ÉTAPE 1: Vérifier ce qu'on reçoit d'ElevenLabs.
+          console.log(`\n--- NOUVEAU BLOC AUDIO REÇU ---`);
+          console.log(`[DEBUG 1] Audio reçu d'ElevenLabs. Taille du payload base64: ${data.audio.length}`);
+
+          // ÉTAPE 2: Décoder le base64 en buffer binaire (PCM 16kHz).
+          const pcm16Buffer = Buffer.from(data.audio, 'base64');
+          console.log(`[DEBUG 2] Taille du buffer PCM 16kHz décodé: ${pcm16Buffer.length} bytes`);
+          
+          // ÉTAPE 3: Ré-échantillonner de 16kHz à 8kHz.
+          const pcm8Downsampled = downsample(pcm16Buffer, 16000, 8000);
+          console.log(`[DEBUG 3] Taille du buffer downsampled 8kHz: ${pcm8Downsampled.length} bytes`);
+
+          // ÉTAPE 4: Convertir le PCM 8kHz en µ-law.
+          const ulawBuffer = pcmToUlaw(pcm8Downsampled);
+          console.log(`[DEBUG 4] Taille du buffer µ-law final: ${ulawBuffer.length} bytes`);
+          
+          // ÉTAPE 5: Ré-encoder le buffer final en base64 pour l'envoyer à Twilio.
+          const audioPayload = ulawBuffer.toString('base64');
+          console.log(`[DEBUG 5] Envoi du payload à Twilio. (100 premiers caractères): ${audioPayload.substring(0, 100)}`);
+          
+          // --- FIN DU BLOC DE DÉBOGAGE ---
+
+          if (twilioWs.readyState === WebSocket.OPEN) {
+            twilioWs.send(JSON.stringify({
+              event: 'media',
+              streamSid: streamSid,
+              media: {
+                payload: audioPayload
+              }
+            }));
+          }
+        } else if (data.type) {
             console.log(`📨 ElevenLabs message: ${data.type}`);
         }
 
@@ -81,10 +96,10 @@ wss.on('connection', (twilioWs, request) => {
     });
 
     elevenWs.on('error', (err) => {
-      console.error('❌ Erreur ElevenLabs:', err.message);
+      console.error('❌ Erreur WebSocket ElevenLabs:', err.message);
     });
 
-    elevenWs.on('close', (code, reason) => { // <-- MODIFIÉ : Ajout des logs
+    elevenWs.on('close', (code, reason) => {
       console.log(`🔴 ElevenLabs déconnecté (code: ${code}, reason: ${reason.toString()})`);
       if (twilioWs.readyState === WebSocket.OPEN) {
         twilioWs.send(JSON.stringify({ event: 'stop', streamSid: streamSid }));
@@ -98,13 +113,9 @@ wss.on('connection', (twilioWs, request) => {
       const msg = JSON.parse(message);
 
       switch (msg.event) {
-        // <-- MODIFIÉ : On remet 'start' qui est le bon événement
         case 'start': 
-          streamSid = msg.start.streamSid; // <-- On lit dans 'msg.start'
-          // callSid = msg.start.callSid; // Tu peux décommenter si besoin
+          streamSid = msg.start.streamSid;
           console.log(`🟢 Stream démarré: ${streamSid}`);
-          
-          // Connexion à ElevenLabs maintenant
           connectToElevenLabs();
           break;
 
@@ -112,12 +123,9 @@ wss.on('connection', (twilioWs, request) => {
           // Audio depuis Twilio (µ-law 8kHz) → ElevenLabs (PCM 16kHz)
           if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
             const ulawBuffer = Buffer.from(msg.media.payload, 'base64');
+            const pcm8Buffer = ulawToPcm(ulawBuffer);
+            const pcm16Upsampled = upsample(pcm8Buffer, 8000, 16000);
             
-            // <-- MODIFIÉ : Conversion audio
-            const pcm16Buffer = ulawToPcm(ulawBuffer);
-            const pcm16Upsampled = upsample(pcm16Buffer, 8000, 16000);
-            
-            // <-- MODIFIÉ : Envoyer en JSON
             elevenWs.send(JSON.stringify({
               "type": "audio_input",
               "audio": pcm16Upsampled.toString('base64')
@@ -145,7 +153,7 @@ wss.on('connection', (twilioWs, request) => {
   });
 
   twilioWs.on('error', (err) => {
-    console.error('❌ Erreur Twilio:', err.message);
+    console.error('❌ Erreur WebSocket Twilio:', err.message);
   });
 });
 
@@ -162,7 +170,6 @@ server.on('upgrade', (request, socket, head) => {
 
 
 // --- Fonctions de conversion audio ---
-// <-- MODIFIÉ : Tout ce bloc est nécessaire
 
 // Convertir µ-law (Buffer) en PCM 16-bit (Buffer)
 function ulawToPcm(ulawBuffer) {
@@ -208,7 +215,7 @@ function pcmToUlaw(pcmBuffer) {
   return ulawBuffer;
 }
 
-// Ré-échantillonnage simple (interpolation linéaire)
+// Ré-échantillonnage (upsampling par interpolation linéaire)
 function upsample(buffer, inputRate, outputRate) {
   if (inputRate === outputRate) return buffer;
   
@@ -230,7 +237,7 @@ function upsample(buffer, inputRate, outputRate) {
   return outputBuffer;
 }
 
-// Downsampling (plus simple, on prend 1 échantillon sur N)
+// Ré-échantillonnage (downsampling en prenant un échantillon sur N)
 function downsample(buffer, inputRate, outputRate) {
     if (inputRate === outputRate) return buffer;
 
