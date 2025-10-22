@@ -99,10 +99,10 @@ wss.on('connection', (twilioWs, request) => {
       const msg = JSON.parse(message);
 
       switch (msg.event) {
-        // <-- MODIFIÉ : L'événement de Twilio s'appelle 'connected', pas 'start'
-        case 'connected': 
-          streamSid = msg.streamSid;
-          // callSid = msg.callSid; // callSid est dans msg.start, mais pas besoin
+        // <-- MODIFIÉ : On remet 'start' qui est le bon événement
+        case 'start': 
+          streamSid = msg.start.streamSid; // <-- On lit dans 'msg.start'
+          // callSid = msg.start.callSid; // Tu peux décommenter si besoin
           console.log(`🟢 Stream démarré: ${streamSid}`);
           
           // Connexion à ElevenLabs maintenant
