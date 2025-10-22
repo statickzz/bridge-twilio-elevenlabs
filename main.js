@@ -59,24 +59,19 @@ wss.on('connection', (twilioWs, request) => {
         const data = JSON.parse(message);
         
         if (data.type === 'audio' && data.audio) {
-          // Audio depuis ElevenLabs (PCM 16kHz) → Twilio (µ-law 8kHz)
-          const pcm16Buffer = Buffer.from(data.audio, 'base64');
-          
-          // Conversion
-          const pcm16Downsampled = downsample(pcm16Buffer, 16000, 8000); // <-- MODIFIÉ
-          const ulawBuffer = pcmToUlaw(pcm16Downsampled); // <-- MODIFIÉ
-          const audioPayload = ulawBuffer.toString('base64');
-          
-          if (twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid: streamSid,
-              media: {
-                payload: audioPayload
-              }
-            }));
-          }
-        } else if (data.type) {
+  // L'audio reçu est déjà au bon format (µ-law 8kHz, base64)
+  // On le relaie directement à Twilio.
+  if (twilioWs.readyState === WebSocket.OPEN) {
+    twilioWs.send(JSON.stringify({
+      event: 'media',
+      streamSid: streamSid,
+      media: {
+        // Le payload d'ElevenLabs est déjà ce que Twilio attend !
+        payload: data.audio 
+      }
+    }));
+  }
+} else if (data.type) {
             console.log(`📨 ElevenLabs message: ${data.type}`);
         }
 
